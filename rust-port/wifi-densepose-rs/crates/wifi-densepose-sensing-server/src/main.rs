@@ -324,6 +324,8 @@ struct NodeState {
     latest_vitals: VitalSigns,
     pub(crate) last_frame_time: Option<std::time::Instant>,
     edge_vitals: Option<Esp32VitalsPacket>,
+    /// UDP source address of this node (for sending commands back).
+    source_addr: Option<std::net::SocketAddr>,
     /// Latest extracted features for cross-node fusion.
     latest_features: Option<FeatureInfo>,
     // ── RuVector Phase 2: Temporal smoothing & coherence gating ──
@@ -371,6 +373,7 @@ impl NodeState {
             latest_vitals: VitalSigns::default(),
             last_frame_time: None,
             edge_vitals: None,
+            source_addr: None,
             latest_features: None,
             prev_keypoints: None,
             motion_energy_history: VecDeque::with_capacity(COHERENCE_WINDOW),
@@ -527,6 +530,10 @@ struct AppStateInner {
     multistatic_fuser: MultistaticFuser,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
+    /// User-configured node positions [x, y, z] in metres, keyed by node_id.
+    node_positions: HashMap<u8, [f64; 3]>,
+    /// UDP socket for sending commands back to ESP32 nodes (identify, etc.).
+    udp_cmd_socket: Option<std::sync::Arc<UdpSocket>>,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -3493,6 +3500,7 @@ async fn nodes_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
                 "rssi_dbm": rssi,
                 "motion_level": &ns.current_motion_level,
                 "person_count": ns.prev_person_count,
+                "position": s.node_positions.get(&id).copied().unwrap_or([0.0, 0.0, 0.0]),
             })
         })
         .collect();
@@ -3500,6 +3508,130 @@ async fn nodes_endpoint(State(state): State<SharedState>) -> Json<serde_json::Va
         "nodes": nodes,
         "total": nodes.len(),
     }))
+}
+
+/// GET /api/v1/nodes/positions — return configured node positions.
+async fn nodes_positions_get(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    let positions: serde_json::Map<String, serde_json::Value> = s.node_positions.iter()
+        .map(|(&id, pos)| (id.to_string(), serde_json::json!(pos)))
+        .collect();
+    Json(serde_json::json!({ "positions": positions }))
+}
+
+/// POST /api/v1/nodes/positions — update one or more node positions.
+/// Body: { "positions": { "1": [x, y, z], "2": [x, y, z], ... } }
+async fn nodes_positions_set(
+    State(state): State<SharedState>,
+    Json(body): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let Some(positions) = body.get("positions").and_then(|v| v.as_object()) else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "Expected { \"positions\": { \"<node_id>\": [x, y, z], ... } }",
+        }));
+    };
+
+    let mut s = state.write().await;
+    let mut updated = 0u32;
+    for (key, val) in positions {
+        let Ok(node_id) = key.parse::<u8>() else { continue };
+        let Some(arr) = val.as_array() else { continue };
+        if arr.len() != 3 { continue; }
+        let coords: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
+        if coords.len() != 3 { continue; }
+        s.node_positions.insert(node_id, [coords[0], coords[1], coords[2]]);
+        updated += 1;
+    }
+
+    // Also push updated positions to multistatic fuser
+    if updated > 0 {
+        let fuser_positions: Vec<(u8, [f64; 3])> = s.node_positions.iter()
+            .map(|(&id, &pos)| (id, pos))
+            .collect();
+        let pos_vec: Vec<[f32; 3]> = fuser_positions.iter()
+            .map(|(_, p)| [p[0] as f32, p[1] as f32, p[2] as f32])
+            .collect();
+        s.multistatic_fuser.set_node_positions(pos_vec);
+    }
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "updated": updated,
+    }))
+}
+
+/// POST /api/v1/nodes/:node_id/identify — send a blink command to an ESP32 node.
+///
+/// The command is a small UDP packet sent to the node's last-known source IP
+/// on port 5006 (CMD_LISTENER_DEFAULT_PORT). The ESP32 firmware blinks its
+/// onboard LED for 3 seconds so the operator can identify the physical device.
+///
+/// Protocol: [magic:4 LE 0xC511FF01][cmd_type:1 = 0x01][node_id:1][duration_ms:2 LE]
+async fn node_identify(
+    State(state): State<SharedState>,
+    Json(req): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let Some(node_id) = req.get("node_id").and_then(|v| v.as_u64()).map(|v| v as u8) else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "Missing or invalid node_id (expected u8)",
+        }));
+    };
+    let s = state.read().await;
+
+    let Some(ns) = s.node_states.get(&node_id) else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Node {} not found", node_id),
+        }));
+    };
+
+    let Some(src) = ns.source_addr else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": format!("Node {} has no known address", node_id),
+        }));
+    };
+
+    let Some(ref socket) = s.udp_cmd_socket else {
+        return Json(serde_json::json!({
+            "status": "error",
+            "message": "UDP command socket not available",
+        }));
+    };
+
+    let socket = socket.clone();
+    let cmd_addr = std::net::SocketAddr::new(src.ip(), 5006);
+    let duration_ms: u16 = 3000;
+
+    // Build the identify command packet.
+    let mut pkt = [0u8; 8];
+    pkt[0..4].copy_from_slice(&0xC511FF01u32.to_le_bytes());
+    pkt[4] = 0x01; // CMD_IDENTIFY
+    pkt[5] = node_id;
+    pkt[6..8].copy_from_slice(&duration_ms.to_le_bytes());
+
+    drop(s); // release read lock before async I/O
+
+    match socket.send_to(&pkt, cmd_addr).await {
+        Ok(_) => {
+            info!("Sent IDENTIFY command to node {} at {}", node_id, cmd_addr);
+            Json(serde_json::json!({
+                "status": "ok",
+                "node_id": node_id,
+                "target": cmd_addr.to_string(),
+                "duration_ms": duration_ms,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to send IDENTIFY to node {} at {}: {}", node_id, cmd_addr, e);
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Send failed: {}", e),
+            }))
+        }
+    }
 }
 
 async fn info_page() -> Html<String> {
@@ -3532,6 +3664,13 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
             return;
         }
     };
+
+    // Store the socket reference so the identify endpoint can send commands back.
+    let socket = std::sync::Arc::new(socket);
+    {
+        let mut s = state.write().await;
+        s.udp_cmd_socket = Some(socket.clone());
+    }
 
     let mut buf = [0u8; 2048];
     loop {
@@ -3571,6 +3710,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let node_id = vitals.node_id;
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
                     ns.last_frame_time = Some(std::time::Instant::now());
+                    ns.source_addr = Some(src);
                     ns.edge_vitals = Some(vitals.clone());
                     ns.rssi_history.push_back(vitals.rssi as f64);
                     if ns.rssi_history.len() > 60 { ns.rssi_history.pop_front(); }
@@ -3627,7 +3767,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: s.node_positions.get(&id).copied().unwrap_or([0.0, 0.0, 0.0]),
                             amplitude: vec![],
                             subcarrier_count: 0,
                         })
@@ -3763,6 +3903,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
                     ns.last_frame_time = Some(std::time::Instant::now());
+                    ns.source_addr = Some(src);
 
                     ns.frame_history.push_back(frame.amplitudes.clone());
                     if ns.frame_history.len() > FRAME_HISTORY_CAPACITY {
@@ -3877,7 +4018,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         .map(|(&id, n)| NodeInfo {
                             node_id: id,
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
-                            position: [2.0, 0.0, 1.5],
+                            position: s.node_positions.get(&id).copied().unwrap_or([0.0, 0.0, 0.0]),
                             amplitude: n.frame_history.back()
                                 .map(|a| a.iter().take(56).cloned().collect())
                                 .unwrap_or_default(),
@@ -4686,6 +4827,15 @@ async fn main() {
             m
         }),
         node_states: HashMap::new(),
+        node_positions: {
+            let mut positions = HashMap::new();
+            if let Some(ref pos_str) = args.node_positions {
+                for (i, pos) in field_bridge::parse_node_positions(pos_str).into_iter().enumerate() {
+                    positions.insert((i + 1) as u8, [pos[0] as f64, pos[1] as f64, pos[2] as f64]);
+                }
+            }
+            positions
+        },
         // Accuracy sprint
         pose_tracker: PoseTracker::new(),
         last_tracker_instant: None,
@@ -4709,6 +4859,7 @@ async fn main() {
         } else {
             None
         },
+        udp_cmd_socket: None,
     }));
 
     // Start background tasks based on source
@@ -4764,6 +4915,8 @@ async fn main() {
         .route("/api/v1/sensing/latest", get(latest))
         // Per-node health endpoint
         .route("/api/v1/nodes", get(nodes_endpoint))
+        .route("/api/v1/nodes/positions", get(nodes_positions_get).post(nodes_positions_set))
+        .route("/api/v1/nodes/identify", post(node_identify))
         // Vital sign endpoints
         .route("/api/v1/vital-signs", get(vital_signs_endpoint))
         .route("/api/v1/edge-vitals", get(edge_vitals_endpoint))

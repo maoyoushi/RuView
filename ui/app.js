@@ -5,6 +5,7 @@ import { DashboardTab } from './components/DashboardTab.js';
 import { HardwareTab } from './components/HardwareTab.js';
 import { LiveDemoTab } from './components/LiveDemoTab.js';
 import { SensingTab } from './components/SensingTab.js';
+import { DevicesTab } from './components/DevicesTab.js';
 import { apiService } from './services/api.service.js';
 import { wsService } from './services/websocket.service.js';
 import { healthService } from './services/health.service.js';
@@ -129,6 +130,12 @@ class WiFiDensePoseApp {
       this.components.demo.init();
     }
 
+    // Devices tab
+    const devicesContainer = document.getElementById('devices');
+    if (devicesContainer) {
+      this.components.devices = new DevicesTab(devicesContainer);
+    }
+
     // Sensing tab
     const sensingContainer = document.getElementById('sensing');
     if (sensingContainer) {
@@ -188,6 +195,14 @@ class WiFiDensePoseApp {
         
       case 'demo':
         // Demo starts manually
+        break;
+
+      case 'devices':
+        if (this.components.devices) {
+          this.components.devices.init().catch(error => {
+            console.error('Failed to initialize devices tab:', error);
+          });
+        }
         break;
 
       case 'sensing':

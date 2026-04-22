@@ -9,6 +9,7 @@ set(SRCS
     "rv_feature_state.c"
     "rv_mesh.c"
     "adaptive_controller.c"
+    "cmd_listener.c"
 )
 
 set(REQUIRES "")

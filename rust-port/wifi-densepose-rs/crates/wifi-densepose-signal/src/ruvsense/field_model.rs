@@ -276,6 +276,10 @@ pub struct FieldNormalMode {
     pub geometry_hash: u64,
     /// Baseline eigenvalue count above Marcenko-Pastur threshold (empty-room).
     pub baseline_eigenvalue_count: usize,
+    /// Noise variance estimated during calibration (Marcenko-Pastur median).
+    pub baseline_noise_var: f64,
+    /// Marcenko-Pastur threshold from calibration. Eigenvalues above this are signal.
+    pub baseline_mp_threshold: f64,
 }
 
 /// Body perturbation extracted from a CSI observation.
@@ -334,12 +338,12 @@ pub struct FieldModel {
 
 /// Diagonal variance fallback for when full covariance SVD is unavailable.
 ///
-/// Returns `(mode_energies, environmental_modes, baseline_eigenvalue_count)`.
+/// Returns `(mode_energies, environmental_modes, baseline_eigenvalue_count, baseline_noise_var, baseline_mp_threshold)`.
 fn diagonal_fallback(
     link_stats: &[LinkBaselineStats],
     n_sc: usize,
     n_modes: usize,
-) -> (Vec<f64>, Vec<Vec<f64>>, usize) {
+) -> (Vec<f64>, Vec<Vec<f64>>, usize, f64, f64) {
     // Average variance across links (diagonal approximation)
     let mut avg_variance = vec![0.0_f64; n_sc];
     for ls in link_stats {
@@ -379,7 +383,8 @@ fn diagonal_fallback(
     let mean_var = if n_sc > 0 { total_var / n_sc as f64 } else { 0.0 };
     let baseline_count = avg_variance.iter().filter(|&&v| v > mean_var * 2.0).count();
 
-    (mode_energies, environmental_modes, baseline_count)
+    let mp_thresh = mean_var * 2.0;
+    (mode_energies, environmental_modes, baseline_count, mean_var, mp_thresh)
 }
 
 impl FieldModel {
@@ -499,7 +504,7 @@ impl FieldModel {
         let baseline: Vec<Vec<f64>> = self.link_stats.iter().map(|ls| ls.mean_vector()).collect();
 
         // --- True eigenvalue decomposition (with diagonal fallback) ---
-        let (mode_energies, environmental_modes, baseline_eig_count) =
+        let (mode_energies, environmental_modes, baseline_eig_count, baseline_noise, baseline_mp) =
             if let Some(ref cov_sum) = self.covariance_sum {
                 if self.covariance_count > 1 {
                     // Compute sample covariance from raw outer products:
@@ -578,7 +583,7 @@ impl FieldModel {
                                 .filter(|&&ev| ev > mp_threshold)
                                 .count();
 
-                            (energies, modes, baseline_count)
+                            (energies, modes, baseline_count, noise_var, mp_threshold)
                         }
                         Err(_) => {
                             // Fallback to diagonal approximation on SVD failure
@@ -632,6 +637,8 @@ impl FieldModel {
             calibrated_at_us: timestamp_us,
             geometry_hash,
             baseline_eigenvalue_count: baseline_eig_count,
+            baseline_noise_var: baseline_noise,
+            baseline_mp_threshold: baseline_mp,
         };
 
         self.modes = Some(field_mode);
@@ -775,26 +782,16 @@ impl FieldModel {
             Err(_) => return Ok(0), // SVD failure = can't estimate
         };
 
-        // Marcenko-Pastur noise estimate: median of POSITIVE eigenvalues
-        // in the bottom half. Excludes zeros from rank-deficient matrices
-        // (common when n_subcarriers > n_frames, e.g. 56 subcarriers / 50 frames).
-        let noise_var = {
-            let mut positive: Vec<f64> = eigenvalues.iter()
-                .copied()
-                .filter(|&e| e > 1e-10)
-                .collect();
-            positive.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            if positive.len() >= 4 {
-                let half = positive.len() / 2;
-                positive[..half].iter().sum::<f64>() / half as f64
-            } else if !positive.is_empty() {
-                positive[0]
-            } else {
-                return Ok(0); // All zero eigenvalues — can't estimate
-            }
-        };
+        // Use calibration noise_var but compute MP threshold for the runtime
+        // sample size. Fewer frames → wider eigenvalue spread → higher threshold.
+        // A 2x safety margin avoids false positives from finite-sample fluctuation
+        // in short observation windows (e.g. 20 frames vs 50 calibration frames).
+        let noise_var = modes.baseline_noise_var;
+        if noise_var < 1e-15 {
+            return Ok(0);
+        }
         let ratio = n as f64 / count as f64;
-        let mp_threshold = noise_var * (1.0 + ratio.sqrt()).powi(2);
+        let mp_threshold = 2.0 * noise_var * (1.0 + ratio.sqrt()).powi(2);
 
         let significant = eigenvalues.iter().filter(|&&ev| ev > mp_threshold).count();
         let occupancy = significant.saturating_sub(modes.baseline_eigenvalue_count);
@@ -1233,6 +1230,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "eigenvalue")]
     fn test_estimate_occupancy_noise_only() {
         let config = FieldModelConfig {
             n_links: 1,

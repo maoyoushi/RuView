@@ -32,6 +32,7 @@
 #include "swarm_bridge.h"
 #include "rv_radio_ops.h"          /* ADR-081 Layer 1 — Radio Abstraction Layer. */
 #include "adaptive_controller.h"   /* ADR-081 Layer 2 — Adaptive controller. */
+#include "cmd_listener.h"
 #ifdef CONFIG_CSI_MOCK_ENABLED
 #include "mock_csi.h"
 #endif
@@ -307,6 +308,11 @@ void app_main(void)
 
     /* Initialize power management. */
     power_mgmt_init(g_nvs_config.power_duty);
+
+    /* Start command listener for server-to-device commands (identify LED blink). */
+#ifndef CONFIG_CSI_MOCK_SKIP_WIFI_CONNECT
+    cmd_listener_start(CMD_LISTENER_DEFAULT_PORT);
+#endif
 
     /* ADR-045: Start AMOLED display task (gracefully skips if no display). */
 #ifdef CONFIG_DISPLAY_ENABLE

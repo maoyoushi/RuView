@@ -20,6 +20,8 @@
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "sdkconfig.h"
 
 /* ADR-060: Access the global NVS config for MAC filter and channel override. */
@@ -224,11 +226,25 @@ static void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type)
 
 void csi_collector_init(void)
 {
-    /* Capture node_id into module-local static at init time. After this point
-     * csi_serialize_frame() uses s_node_id exclusively, isolating the UDP
-     * frame node_id field from any memory corruption of g_nvs_config. */
+    /* #390 root-cause fix: re-read node_id directly from NVS instead of
+     * trusting g_nvs_config, which wifi_init_sta() memory corruption can
+     * revert to the Kconfig default of 1. */
     s_node_id = g_nvs_config.node_id;
-    ESP_LOGI(TAG, "Captured node_id=%u at init (defensive copy for #232/#375/#385/#390)",
+    {
+        nvs_handle_t h;
+        if (nvs_open("csi_cfg", NVS_READONLY, &h) == ESP_OK) {
+            uint8_t nv;
+            if (nvs_get_u8(h, "node_id", &nv) == ESP_OK) {
+                if (nv != s_node_id) {
+                    ESP_LOGW(TAG, "node_id clobber confirmed: g_nvs_config=%u but NVS=%u — using NVS value",
+                             (unsigned)s_node_id, (unsigned)nv);
+                }
+                s_node_id = nv;
+            }
+            nvs_close(h);
+        }
+    }
+    ESP_LOGI(TAG, "node_id=%u (NVS-verified, fix for #390)",
              (unsigned)s_node_id);
 
     /* ADR-060: Determine the CSI channel.
