@@ -434,6 +434,114 @@ struct PerNodeFeatureInfo {
     stale: bool,
 }
 
+/// Multi-node presence consensus with temporal hysteresis.
+///
+/// Single ESP32 nodes over-report `vitals.presence` because the firmware
+/// auto-calibrates its motion-energy threshold to ambient noise; once
+/// calibration is done in a quiet room, ordinary WiFi multipath jitter
+/// trips it and `presence` flaps high. Trusting any single node's vote
+/// kept the broadcast count pinned to ≥1 even in an empty room.
+///
+/// This aggregator votes across all active nodes (last 5 s of frames):
+/// - A node only counts as "voting yes" when it reports `presence=true`
+///   AND `motion_energy > MOTION_ENERGY_VOTE_THRESHOLD` (rejects the
+///   firmware noise floor).
+/// - The consensus needs ≥50 % of active nodes to agree on either side.
+/// - State changes are gated by hysteresis — a few consecutive YES votes
+///   to flip on, more consecutive NO votes to flip off — so brief stale
+///   frames don't cause the count to flap.
+#[derive(Debug, Clone)]
+struct PresenceConsensus {
+    /// Consecutive raw-vote=YES updates since last NO.
+    consecutive_yes: u32,
+    /// Consecutive raw-vote=NO updates since last YES.
+    consecutive_no: u32,
+    /// Currently displayed presence state.
+    state: bool,
+    /// Currently displayed person count (0 when `state == false`).
+    count_state: usize,
+}
+
+impl PresenceConsensus {
+    /// Consecutive YES votes required to flip absent → present.
+    /// At ~10–15 vote/s this is ≈0.2–0.3 s — fast enough to feel responsive.
+    const PRESENT_HOLD_TICKS: u32 = 3;
+    /// Consecutive NO votes required to flip present → absent.
+    /// At ~10–15 vote/s this is ≈1–1.5 s — long enough to ride through stale node frames.
+    const ABSENT_HOLD_TICKS: u32 = 15;
+    /// Below this `motion_energy` a node's presence vote is treated as
+    /// noise and ignored. Matches the firmware default uncalibrated
+    /// threshold (`edge_processing.c:811`).
+    const MOTION_ENERGY_VOTE_THRESHOLD: f64 = 0.10;
+    /// Strong-motion threshold per node (used for multi-person upgrade).
+    const STRONG_MOTION_THRESHOLD: f64 = 0.20;
+    /// Number of nodes that must simultaneously see strong motion before
+    /// the displayed count is upgraded from 1 to 2. Spatial spread of
+    /// strong motion is a rough proxy for >1 person in the room.
+    const MULTI_PERSON_NODE_COUNT: usize = 3;
+
+    fn new() -> Self {
+        Self { consecutive_yes: 0, consecutive_no: 0, state: false, count_state: 0 }
+    }
+
+    /// Aggregate every active node's edge-vitals report into a single
+    /// (presence, count) pair. Returns the displayed values after applying
+    /// hysteresis. Call once per incoming packet.
+    fn update_from_nodes(&mut self, node_states: &HashMap<u8, NodeState>) -> (bool, usize) {
+        let now = std::time::Instant::now();
+        let active: Vec<&NodeState> = node_states.values()
+            .filter(|ns| ns.last_frame_time
+                .map(|t| now.duration_since(t).as_secs() < 5)
+                .unwrap_or(false))
+            .collect();
+
+        if active.is_empty() {
+            self.consecutive_yes = 0;
+            self.consecutive_no = self.consecutive_no.saturating_add(1);
+            if self.state && self.consecutive_no >= Self::ABSENT_HOLD_TICKS {
+                self.state = false;
+                self.count_state = 0;
+            }
+            return (self.state, self.count_state);
+        }
+
+        let yes_voters: usize = active.iter().filter(|ns| {
+            let v = ns.edge_vitals.as_ref();
+            let pres = v.map_or(false, |x| x.presence);
+            let me = v.map_or(0.0, |x| x.motion_energy as f64);
+            pres && me > Self::MOTION_ENERGY_VOTE_THRESHOLD
+        }).count();
+        let raw_vote = yes_voters * 2 >= active.len();
+
+        if raw_vote {
+            self.consecutive_yes = self.consecutive_yes.saturating_add(1);
+            self.consecutive_no = 0;
+            if !self.state && self.consecutive_yes >= Self::PRESENT_HOLD_TICKS {
+                self.state = true;
+                self.count_state = 1;
+            }
+        } else {
+            self.consecutive_no = self.consecutive_no.saturating_add(1);
+            self.consecutive_yes = 0;
+            if self.state && self.consecutive_no >= Self::ABSENT_HOLD_TICKS {
+                self.state = false;
+                self.count_state = 0;
+            }
+        }
+
+        if self.state {
+            let strong_voters: usize = active.iter().filter(|ns| {
+                ns.edge_vitals.as_ref()
+                    .map_or(0.0, |x| x.motion_energy as f64)
+                    > Self::STRONG_MOTION_THRESHOLD
+            }).count();
+            self.count_state = if strong_voters >= Self::MULTI_PERSON_NODE_COUNT { 2 } else { 1 };
+        }
+
+        (self.state, self.count_state)
+    }
+}
+
 /// Shared application state
 struct AppStateInner {
     latest_update: Option<SensingUpdate>,
@@ -540,6 +648,11 @@ struct AppStateInner {
     node_positions: HashMap<u8, [f64; 3]>,
     /// UDP socket for sending commands back to ESP32 nodes (identify, etc.).
     udp_cmd_socket: Option<std::sync::Arc<UdpSocket>>,
+    /// Multi-node presence consensus + hysteresis. Drives the broadcast
+    /// `classification.presence` and `estimated_persons` so the count can
+    /// actually return to 0 in an empty room (single-node `vitals.presence`
+    /// over-reports due to firmware noise-floor calibration).
+    presence_consensus: PresenceConsensus,
 }
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
@@ -3746,33 +3859,36 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     s.tick += 1;
                     let tick = s.tick;
 
-                    let motion_level = if vitals.motion { "present_moving" }
-                        else if vitals.presence { "present_still" }
+                    // Multi-node consensus + hysteresis. The single packet's
+                    // `vitals.presence` is unreliable (firmware noise floor flaps
+                    // it high), so we aggregate across all active nodes before
+                    // deciding what to broadcast. See `PresenceConsensus` for the
+                    // full reasoning. Updates internal state on every packet.
+                    let now = std::time::Instant::now();
+                    let (consensus_present, consensus_count) = {
+                        // Split borrow: presence_consensus (mutable) + node_states
+                        // (immutable) are disjoint fields of the same struct.
+                        let s_ref: &mut AppStateInner = &mut *s;
+                        s_ref.presence_consensus.update_from_nodes(&s_ref.node_states)
+                    };
+
+                    let motion_level = if consensus_present && vitals.motion { "present_moving" }
+                        else if consensus_present { "present_still" }
                         else { "absent" };
-                    let motion_score = if vitals.motion { 0.8 }
-                        else if vitals.presence { 0.3 }
+                    let motion_score = if consensus_present && vitals.motion { 0.8 }
+                        else if consensus_present { 0.3 }
                         else { 0.05 };
 
-                    // Aggregate person count: gate on presence first (matching WiFi path).
-                    let now = std::time::Instant::now();
-                    let total_persons = if vitals.presence {
-                        let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
-                            &s.multistatic_fuser, &s.node_states,
-                        );
-                        match fused {
-                            Some(ref f) => {
-                                let score = multistatic_bridge::compute_person_score_from_amplitudes(&f.fused_amplitude);
-                                s.smoothed_person_score = s.smoothed_person_score * 0.90 + score * 0.10;
-                                let count = s.person_count();
-                                s.prev_person_count = count;
-                                count.max(1) // presence=true => at least 1
-                            }
-                            None => fallback_count.unwrap_or(0).max(1),
-                        }
-                    } else {
-                        s.prev_person_count = 0;
-                        0
-                    };
+                    // total_persons is driven by consensus, not by the per-packet
+                    // `vitals.presence` / `vitals.n_persons` (which is just the
+                    // firmware's top-K subcarrier partition count, always ≥1).
+                    let total_persons = consensus_count;
+                    s.prev_person_count = total_persons;
+                    if !consensus_present {
+                        // Decay the score buffer too so a transient false-presence
+                        // event doesn't leave a lingering high score.
+                        s.smoothed_person_score *= 0.90;
+                    }
 
                     // Feed field model calibration if active (use per-node history for ESP32).
                     if let Some(frame_history) = s.node_states.get(&node_id).map(|ns| ns.frame_history.clone()) {
@@ -3812,15 +3928,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let mut classification = ClassificationInfo {
                         motion_level: motion_level.to_string(),
-                        presence: vitals.presence,
-                        confidence: vitals.presence_score as f64,
+                        presence: consensus_present,
+                        confidence: if consensus_present { vitals.presence_score as f64 } else { 0.0 },
                     };
 
-                    // Boost classification confidence with multi-node coverage.
+                    // Boost classification confidence with multi-node coverage,
+                    // but only when consensus actually says someone is present.
                     let n_active = s.node_states.values()
                         .filter(|ns| ns.last_frame_time.map_or(false, |t| now.duration_since(t).as_secs() < 10))
                         .count();
-                    if n_active > 1 {
+                    if consensus_present && n_active > 1 {
                         classification.confidence = (classification.confidence
                             * (1.0 + 0.15 * (n_active as f64 - 1.0))).clamp(0.0, 1.0);
                     }
@@ -4009,9 +4126,23 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         else if classification.motion_level == "present_still" { 0.3 }
                         else { 0.05 };
 
-                    // Aggregate person count: gate on presence first (matching WiFi path).
+                    // Multi-node consensus + hysteresis (same gate as edge-vitals
+                    // path). Override the per-packet `classification.presence` so
+                    // a single noisy node can't drive the broadcast count.
                     let now = std::time::Instant::now();
-                    let total_persons = if classification.presence {
+                    let (consensus_present, consensus_count) = {
+                        // Split borrow: presence_consensus (mutable) + node_states
+                        // (immutable) are disjoint fields of the same struct.
+                        let s_ref: &mut AppStateInner = &mut *s;
+                        s_ref.presence_consensus.update_from_nodes(&s_ref.node_states)
+                    };
+                    classification.presence = consensus_present;
+                    if !consensus_present {
+                        classification.motion_level = "absent".to_string();
+                        classification.confidence = 0.0;
+                    }
+
+                    let total_persons = if consensus_present {
                         let (fused, fallback_count) = multistatic_bridge::fuse_or_fallback(
                             &s.multistatic_fuser, &s.node_states,
                         );
@@ -4021,12 +4152,13 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                                 s.smoothed_person_score = s.smoothed_person_score * 0.90 + score * 0.10;
                                 let count = s.person_count();
                                 s.prev_person_count = count;
-                                count.max(1)
+                                count.max(consensus_count).max(1)
                             }
-                            None => fallback_count.unwrap_or(0).max(1),
+                            None => fallback_count.unwrap_or(consensus_count).max(consensus_count).max(1),
                         }
                     } else {
                         s.prev_person_count = 0;
+                        s.smoothed_person_score *= 0.90;
                         0
                     };
 
@@ -4898,6 +5030,7 @@ async fn main() {
             None
         },
         udp_cmd_socket: None,
+        presence_consensus: PresenceConsensus::new(),
     }));
 
     // Start background tasks based on source
@@ -5060,4 +5193,163 @@ async fn main() {
     }
 
     info!("Server shut down cleanly");
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a NodeState with fresh `last_frame_time` and a vitals packet.
+    /// `motion_energy` controls the consensus vote; `presence` is the firmware's
+    /// raw flag.
+    fn node_with_vitals(node_id: u8, presence: bool, motion_energy: f32) -> NodeState {
+        let mut ns = NodeState::new();
+        ns.last_frame_time = Some(std::time::Instant::now());
+        ns.edge_vitals = Some(Esp32VitalsPacket {
+            node_id,
+            presence,
+            fall_detected: false,
+            motion: presence,
+            breathing_rate_bpm: 0.0,
+            heartrate_bpm: 0.0,
+            rssi: -55,
+            n_persons: if presence { 1 } else { 0 },
+            motion_energy,
+            presence_score: motion_energy,
+            timestamp_ms: 0,
+        });
+        ns
+    }
+
+    fn five_node_room(presence: bool, motion_energy: f32) -> HashMap<u8, NodeState> {
+        let mut m = HashMap::new();
+        for id in 1..=5u8 {
+            m.insert(id, node_with_vitals(id, presence, motion_energy));
+        }
+        m
+    }
+
+    #[test]
+    fn empty_room_stays_absent() {
+        // All nodes report presence=false. Consensus must stay (false, 0).
+        let mut c = PresenceConsensus::new();
+        let nodes = five_node_room(false, 0.01);
+        for _ in 0..30 {
+            let (p, n) = c.update_from_nodes(&nodes);
+            assert!(!p);
+            assert_eq!(n, 0);
+        }
+    }
+
+    #[test]
+    fn over_triggered_presence_below_motion_floor_stays_absent() {
+        // Firmware over-reports: presence=true, but motion_energy below
+        // MOTION_ENERGY_VOTE_THRESHOLD (0.10). Consensus must NOT flip on.
+        // This is the regression that was pinning the broadcast count to 1.
+        let mut c = PresenceConsensus::new();
+        let nodes = five_node_room(true, 0.05);
+        for _ in 0..30 {
+            let (p, n) = c.update_from_nodes(&nodes);
+            assert!(!p, "low-motion presence votes must be ignored");
+            assert_eq!(n, 0);
+        }
+    }
+
+    #[test]
+    fn confirmed_presence_flips_on_after_hold_ticks() {
+        let mut c = PresenceConsensus::new();
+        let nodes = five_node_room(true, 0.15); // above 0.10 vote threshold
+        // First (PRESENT_HOLD_TICKS - 1) ticks must keep state=false.
+        for i in 0..(PresenceConsensus::PRESENT_HOLD_TICKS - 1) {
+            let (p, _) = c.update_from_nodes(&nodes);
+            assert!(!p, "premature flip at tick {i}");
+        }
+        // Final tick flips to present.
+        let (p, n) = c.update_from_nodes(&nodes);
+        assert!(p);
+        assert_eq!(n, 1, "single-cluster motion = 1 person");
+    }
+
+    #[test]
+    fn present_state_decays_to_absent_after_sustained_no_votes() {
+        let mut c = PresenceConsensus::new();
+        // Drive into present state.
+        let busy = five_node_room(true, 0.15);
+        for _ in 0..PresenceConsensus::PRESENT_HOLD_TICKS {
+            c.update_from_nodes(&busy);
+        }
+        assert!(c.state);
+        // Now everyone goes quiet. Must take ABSENT_HOLD_TICKS to flip off.
+        let quiet = five_node_room(false, 0.01);
+        for i in 0..(PresenceConsensus::ABSENT_HOLD_TICKS - 1) {
+            let (p, _) = c.update_from_nodes(&quiet);
+            assert!(p, "premature absent flip at tick {i}");
+        }
+        let (p, n) = c.update_from_nodes(&quiet);
+        assert!(!p);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn brief_jitter_does_not_flip_state() {
+        // Once present, a single absent vote sandwiched between present votes
+        // must not move the displayed state — that was the 1↔0 flapping the
+        // user reported when the firmware noise floor briefly cleared.
+        let mut c = PresenceConsensus::new();
+        let busy = five_node_room(true, 0.15);
+        let quiet = five_node_room(false, 0.01);
+        for _ in 0..PresenceConsensus::PRESENT_HOLD_TICKS {
+            c.update_from_nodes(&busy);
+        }
+        assert!(c.state);
+        // 3 quick quiet ticks (well under ABSENT_HOLD_TICKS=15).
+        for _ in 0..3 {
+            let (p, _) = c.update_from_nodes(&quiet);
+            assert!(p, "single quiet burst must not flip state");
+        }
+        // Resume busy.
+        for _ in 0..3 {
+            let (p, _) = c.update_from_nodes(&busy);
+            assert!(p);
+        }
+    }
+
+    #[test]
+    fn multiple_strong_motion_nodes_upgrade_count_to_two() {
+        let mut c = PresenceConsensus::new();
+        // 3 of 5 nodes show motion above STRONG_MOTION_THRESHOLD (0.20).
+        let mut nodes = HashMap::new();
+        for id in 1..=3u8 {
+            nodes.insert(id, node_with_vitals(id, true, 0.30)); // strong
+        }
+        for id in 4..=5u8 {
+            nodes.insert(id, node_with_vitals(id, true, 0.15)); // moderate, still votes
+        }
+        for _ in 0..PresenceConsensus::PRESENT_HOLD_TICKS {
+            c.update_from_nodes(&nodes);
+        }
+        let (p, n) = c.update_from_nodes(&nodes);
+        assert!(p);
+        assert_eq!(n, 2, "≥3 strong-motion nodes ⇒ count upgraded to 2");
+    }
+
+    #[test]
+    fn all_nodes_stale_treated_as_no_voters() {
+        // Stale nodes (>5 s since last frame) must not contribute votes.
+        let mut c = PresenceConsensus::new();
+        let mut nodes = HashMap::new();
+        let stale_time = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        for id in 1..=5u8 {
+            let mut ns = node_with_vitals(id, true, 0.15);
+            ns.last_frame_time = Some(stale_time);
+            nodes.insert(id, ns);
+        }
+        for _ in 0..30 {
+            let (p, n) = c.update_from_nodes(&nodes);
+            assert!(!p, "stale nodes must not drive presence");
+            assert_eq!(n, 0);
+        }
+    }
 }
