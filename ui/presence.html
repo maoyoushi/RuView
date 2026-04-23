@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RuView 人员在位 — 真实设备数据</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0b0f14;
+      --panel: #121822;
+      --panel-2: #0f151e;
+      --line: #1e2a3a;
+      --text: #d5e3f0;
+      --muted: #6e8296;
+      --accent: #3ac1ff;
+      --ok: #3ddc84;
+      --warn: #f6b84a;
+      --err: #ff5a6b;
+      --ghost: #243040;
+    }
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, "SF Pro Text", "PingFang SC", "Microsoft YaHei", monospace;
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 24px 48px; }
+
+    /* Top bar */
+    .topbar {
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+      padding: 10px 0 16px; border-bottom: 1px solid var(--line);
+    }
+    .brand { font-size: 15px; letter-spacing: 0.06em; color: var(--muted); }
+    .brand b { color: var(--text); letter-spacing: 0; }
+    .back-link {
+      color: var(--muted); text-decoration: none; font-size: 13px;
+      padding: 4px 10px; border: 1px solid var(--line); border-radius: 4px;
+    }
+    .back-link:hover { color: var(--text); border-color: var(--muted); }
+    .spacer { flex: 1; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: 12px; padding: 6px 10px;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+      color: var(--muted);
+    }
+    .pill .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--ghost);
+    }
+    .pill.ok     { border-color: #1b3d2c; color: var(--ok); }
+    .pill.ok .dot     { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .pill.warn   { border-color: #3d2f1b; color: var(--warn); }
+    .pill.warn .dot   { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+    .pill.err    { border-color: #3d1b24; color: var(--err); }
+    .pill.err .dot    { background: var(--err); box-shadow: 0 0 8px var(--err); }
+
+    /* Banner for mock data */
+    .mock-banner {
+      margin-top: 14px;
+      padding: 10px 14px; border-radius: 6px;
+      background: rgba(255, 90, 107, 0.08);
+      border: 1px solid #3d1b24;
+      color: var(--err);
+      font-size: 13px;
+      display: none;
+    }
+    .mock-banner.show { display: block; }
+
+    /* Main count card */
+    .count-card {
+      margin-top: 24px;
+      background: linear-gradient(180deg, var(--panel) 0%, var(--panel-2) 100%);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 32px 28px;
+      display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: center;
+    }
+    .count-left .label {
+      font-size: 13px; color: var(--muted); letter-spacing: 0.2em; text-transform: uppercase;
+    }
+    .count-left .num {
+      font-size: 112px; line-height: 1; font-weight: 200;
+      color: var(--text);
+      font-variant-numeric: tabular-nums;
+      margin-top: 8px;
+    }
+    .count-left .num.idle { color: var(--muted); font-weight: 100; }
+    .count-left .num.mock { color: var(--err); }
+    .count-left .unit { font-size: 22px; color: var(--muted); margin-left: 10px; }
+    .count-left .reason {
+      margin-top: 10px; font-size: 13px; color: var(--muted);
+    }
+    .count-right {
+      text-align: right;
+      display: flex; flex-direction: column; gap: 10px; min-width: 220px;
+    }
+    .kv { display: flex; justify-content: space-between; gap: 16px; font-size: 13px; }
+    .kv .k { color: var(--muted); }
+    .kv .v { color: var(--text); font-variant-numeric: tabular-nums; }
+
+    /* Section header */
+    h2 {
+      margin-top: 32px; margin-bottom: 10px;
+      font-size: 12px; letter-spacing: 0.24em; text-transform: uppercase;
+      color: var(--muted); font-weight: 500;
+    }
+
+    /* Node table */
+    .nodes {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      padding: 10px 14px; text-align: left; font-size: 13px;
+      border-bottom: 1px solid var(--line);
+    }
+    th {
+      font-weight: 500; color: var(--muted); font-size: 11px;
+      letter-spacing: 0.12em; text-transform: uppercase;
+      background: var(--panel-2);
+    }
+    tr:last-child td { border-bottom: none; }
+    td.num { font-variant-numeric: tabular-nums; color: var(--text); }
+    td.muted { color: var(--muted); }
+    .node-empty {
+      padding: 28px; text-align: center; color: var(--muted); font-size: 13px;
+    }
+    .status-tag {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 11px; padding: 3px 8px; border-radius: 3px;
+      background: var(--ghost); color: var(--muted);
+    }
+    .status-tag.active { background: rgba(61, 220, 132, 0.12); color: var(--ok); }
+    .status-tag.stale  { background: rgba(255, 90, 107, 0.12); color: var(--err); }
+
+    /* Details */
+    details {
+      margin-top: 24px; background: var(--panel); border: 1px solid var(--line);
+      border-radius: 8px; padding: 12px 16px;
+    }
+    details summary {
+      cursor: pointer; color: var(--muted); font-size: 12px;
+      letter-spacing: 0.12em; text-transform: uppercase;
+    }
+    details pre {
+      margin-top: 12px; font-size: 11px; color: var(--muted);
+      white-space: pre-wrap; word-break: break-all;
+      max-height: 320px; overflow-y: auto;
+    }
+
+    /* Confidence bar */
+    .bar-wrap {
+      width: 140px; height: 6px; background: var(--ghost); border-radius: 3px;
+      margin-left: auto; overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%; background: var(--accent);
+      width: 0%; transition: width 0.4s ease;
+    }
+    .bar-fill.ok { background: var(--ok); }
+    .bar-fill.warn { background: var(--warn); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+
+    <div class="topbar">
+      <div class="brand"><b>RuView</b> · 人员在位检测（真实设备）</div>
+      <a class="back-link" href="index.html">← 返回</a>
+      <div class="spacer"></div>
+      <span id="pill-http" class="pill"><span class="dot"></span>HTTP —</span>
+      <span id="pill-ws" class="pill"><span class="dot"></span>WS —</span>
+      <span id="pill-source" class="pill"><span class="dot"></span>数据源 —</span>
+    </div>
+
+    <div id="mock-banner" class="mock-banner">
+      ⚠ 当前数据源为合成/模拟数据（<span id="mock-source-name">—</span>）。人数结果不反映现场真实情况。
+      要获取真实数据，请启动 <code>wifi-densepose-sensing-server</code> 并使其接收 ESP32 上报的 CSI 帧。
+    </div>
+
+    <div class="count-card">
+      <div class="count-left">
+        <div class="label">当前人数</div>
+        <div class="num idle"><span id="person-count">—</span><span class="unit" id="person-unit">人</span></div>
+        <div class="reason" id="count-reason">等待真实设备上报…</div>
+      </div>
+      <div class="count-right">
+        <div class="kv"><span class="k">在线节点</span><span class="v"><span id="nodes-active">0</span> / <span id="nodes-total">0</span></span></div>
+        <div class="kv"><span class="k">存在性</span><span class="v" id="presence-val">—</span></div>
+        <div class="kv"><span class="k">置信度</span><div class="bar-wrap"><div id="conf-bar" class="bar-fill"></div></div></div>
+        <div class="kv"><span class="k">运动等级</span><span class="v" id="motion-val">—</span></div>
+        <div class="kv"><span class="k">最近更新</span><span class="v" id="last-update">—</span></div>
+      </div>
+    </div>
+
+    <h2>ESP32 节点明细（每 1 秒刷新）</h2>
+    <div class="nodes">
+      <table>
+        <thead>
+          <tr>
+            <th>节点 ID</th>
+            <th>状态</th>
+            <th>RSSI</th>
+            <th>运动</th>
+            <th>节点估计人数</th>
+            <th>上次心跳</th>
+            <th>位置 (x,y,z)</th>
+          </tr>
+        </thead>
+        <tbody id="nodes-tbody">
+          <tr><td colspan="7" class="node-empty">尚未发现节点。请确认 ESP32 已上电并连接到传感服务器 UDP 端口。</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <details>
+      <summary>原始 SensingUpdate（最近一帧）</summary>
+      <pre id="raw-json">—</pre>
+    </details>
+  </div>
+
+  <script>
+  (function () {
+    'use strict';
+
+    // ── Config ──────────────────────────────────────────────────────────────
+    const HTTP_BASE = ''; // same-origin; the server serves /ui from its own port
+    const NODES_POLL_MS = 1000;
+    const INFO_POLL_MS = 5000;
+    const STALE_NODE_MS = 5000;        // matches nodes_endpoint threshold
+    const STALE_UPDATE_MS = 3000;      // last sensing update heard via WS
+    const WS_RECONNECT_MS = 2000;
+
+    // ── DOM refs ────────────────────────────────────────────────────────────
+    const el = {
+      pillHttp:   document.getElementById('pill-http'),
+      pillWs:     document.getElementById('pill-ws'),
+      pillSource: document.getElementById('pill-source'),
+      mockBanner: document.getElementById('mock-banner'),
+      mockName:   document.getElementById('mock-source-name'),
+      personCount:document.getElementById('person-count'),
+      personUnit: document.getElementById('person-unit'),
+      countReason:document.getElementById('count-reason'),
+      personNum:  document.querySelector('.count-left .num'),
+      nodesActive:document.getElementById('nodes-active'),
+      nodesTotal: document.getElementById('nodes-total'),
+      presence:   document.getElementById('presence-val'),
+      confBar:    document.getElementById('conf-bar'),
+      motion:     document.getElementById('motion-val'),
+      lastUpdate: document.getElementById('last-update'),
+      nodesTbody: document.getElementById('nodes-tbody'),
+      rawJson:    document.getElementById('raw-json'),
+    };
+
+    // ── State ───────────────────────────────────────────────────────────────
+    const state = {
+      source: null,             // from /api/v1/info: 'esp32' | 'esp32:offline' | 'wifi:<ssid>' | 'simulated' | 'synthetic'
+      lastSensingUpdate: null,  // last SensingUpdate object from WS
+      lastSensingAt: 0,         // ms timestamp (client clock) when last update arrived
+      nodes: [],                // last /api/v1/nodes response
+      ws: null,
+      wsConnected: false,
+    };
+
+    // ── Helpers ─────────────────────────────────────────────────────────────
+    function setPill(elm, mode, text) {
+      elm.className = 'pill ' + mode;
+      elm.innerHTML = '<span class="dot"></span>' + text;
+    }
+    function isRealSource(src) {
+      if (!src) return false;
+      if (src === 'esp32') return true;
+      if (src.startsWith('wifi:')) return true;
+      return false;
+    }
+    function isMockSource(src) {
+      return src === 'simulated' || src === 'synthetic';
+    }
+    function isOfflineSource(src) {
+      return src && src.endsWith(':offline');
+    }
+    function fmtAge(ms) {
+      if (ms == null || !isFinite(ms)) return '—';
+      if (ms < 1000) return ms + ' ms';
+      if (ms < 60000) return (ms / 1000).toFixed(1) + ' s';
+      return Math.floor(ms / 60000) + ' min';
+    }
+    function fmtPos(p) {
+      if (!p || p.length !== 3) return '—';
+      if (p[0] === 0 && p[1] === 0 && p[2] === 0) return '未配置';
+      return p.map(v => v.toFixed(2)).join(', ');
+    }
+
+    // ── Main render pass ────────────────────────────────────────────────────
+    function render() {
+      // 1. Source pill
+      const src = state.source;
+      if (isRealSource(src))       setPill(el.pillSource, 'ok',   '数据源 ' + src);
+      else if (isOfflineSource(src)) setPill(el.pillSource, 'err',  '数据源 ' + src);
+      else if (isMockSource(src))  setPill(el.pillSource, 'warn', '数据源 ' + src + '（模拟）');
+      else                         setPill(el.pillSource, '',     '数据源 ' + (src || '—'));
+
+      // Mock banner
+      if (isMockSource(src)) {
+        el.mockBanner.classList.add('show');
+        el.mockName.textContent = src;
+      } else {
+        el.mockBanner.classList.remove('show');
+      }
+
+      // 2. Node table + counts
+      const nodes = state.nodes || [];
+      const activeNodes = nodes.filter(n => n.status === 'active');
+      el.nodesTotal.textContent = nodes.length;
+      el.nodesActive.textContent = activeNodes.length;
+
+      if (nodes.length === 0) {
+        el.nodesTbody.innerHTML =
+          '<tr><td colspan="7" class="node-empty">尚未发现节点。请确认 ESP32 已上电并连接到传感服务器 UDP 端口。</td></tr>';
+      } else {
+        el.nodesTbody.innerHTML = nodes.map(n => {
+          const tag = n.status === 'active'
+            ? '<span class="status-tag active">active</span>'
+            : '<span class="status-tag stale">stale</span>';
+          const rssi = (typeof n.rssi_dbm === 'number') ? n.rssi_dbm.toFixed(0) + ' dBm' : '—';
+          return '<tr>' +
+            '<td class="num">' + n.node_id + '</td>' +
+            '<td>' + tag + '</td>' +
+            '<td class="num">' + rssi + '</td>' +
+            '<td class="muted">' + (n.motion_level || '—') + '</td>' +
+            '<td class="num">' + (n.person_count ?? 0) + '</td>' +
+            '<td class="num muted">' + fmtAge(n.last_seen_ms) + '</td>' +
+            '<td class="muted">' + fmtPos(n.position) + '</td>' +
+          '</tr>';
+        }).join('');
+      }
+
+      // 3. Determine honest person count
+      const update = state.lastSensingUpdate;
+      const now = Date.now();
+      const updateAgeMs = state.lastSensingAt ? (now - state.lastSensingAt) : Infinity;
+      const freshUpdate = update && updateAgeMs < STALE_UPDATE_MS;
+
+      // Last update indicator
+      el.lastUpdate.textContent = state.lastSensingAt ? fmtAge(updateAgeMs) + ' 前' : '—';
+
+      // Presence / confidence / motion — only show if update is fresh AND source is trustworthy
+      const trustworthy = freshUpdate && isRealSource(src) && activeNodes.length > 0;
+      if (trustworthy) {
+        const cls = update.classification || {};
+        el.presence.textContent = cls.presence ? '有人' : '无人';
+        el.presence.style.color = cls.presence ? 'var(--ok)' : 'var(--muted)';
+        const confPct = Math.round((cls.confidence || 0) * 100);
+        el.confBar.style.width = confPct + '%';
+        el.confBar.className = 'bar-fill ' + (confPct > 70 ? 'ok' : confPct > 40 ? 'warn' : '');
+        el.motion.textContent = cls.motion_level || '—';
+      } else {
+        el.presence.textContent = '—';
+        el.presence.style.color = 'var(--muted)';
+        el.confBar.style.width = '0%';
+        el.confBar.className = 'bar-fill';
+        el.motion.textContent = '—';
+      }
+
+      // Raw JSON (always the last frame we saw, for debugging)
+      el.rawJson.textContent = update ? JSON.stringify(update, null, 2) : '—';
+
+      // Decide displayed person count
+      let count = null;
+      let reason = '';
+      let mode = 'idle'; // 'idle' | 'mock' | 'real'
+
+      if (activeNodes.length === 0) {
+        reason = nodes.length === 0
+          ? '无节点上报。启动传感服务器并让 ESP32 发送 CSI 帧后才会出现数据。'
+          : '所有节点都处于 stale 状态（' + STALE_NODE_MS + 'ms 内无心跳），判定为离线。';
+      } else if (isOfflineSource(src)) {
+        reason = '服务器报告 ' + src + '，原始 CSI 数据流已断开。';
+      } else if (isMockSource(src)) {
+        reason = '服务器当前在 ' + src + ' 模式下运行，未接入真实射频。';
+        mode = 'mock';
+        // Still show the number under the mock warning so the user sees what the demo generates.
+        if (freshUpdate) count = resolveCountFromUpdate(update);
+      } else if (!freshUpdate) {
+        reason = '最近 ' + (STALE_UPDATE_MS / 1000).toFixed(0) + ' 秒内未收到 sensing_update；可能 WebSocket 未连通。';
+      } else if (!isRealSource(src)) {
+        reason = '数据源 "' + src + '" 未被识别为真实设备来源。';
+      } else {
+        count = resolveCountFromUpdate(update);
+        mode = 'real';
+        reason = count === 0
+          ? '真实数据：' + activeNodes.length + ' 个节点在线，未检测到人员。'
+          : '真实数据：基于 ' + activeNodes.length + ' 个在线节点的 CSI 融合结果。';
+      }
+
+      // Paint count
+      if (count == null) {
+        el.personCount.textContent = '—';
+        el.personUnit.textContent = '';
+        el.personNum.className = 'num idle';
+      } else {
+        el.personCount.textContent = count;
+        el.personUnit.textContent = '人';
+        el.personNum.className = 'num' + (mode === 'mock' ? ' mock' : '');
+      }
+      el.countReason.textContent = reason;
+    }
+
+    /** Derive person count from a SensingUpdate. Prefer explicit fields over heuristics. */
+    function resolveCountFromUpdate(update) {
+      if (!update) return 0;
+      if (typeof update.estimated_persons === 'number') return update.estimated_persons;
+      if (Array.isArray(update.persons)) return update.persons.length;
+      // Fall back to per-node max if server did not set estimated_persons.
+      const nodeMax = (state.nodes || [])
+        .filter(n => n.status === 'active')
+        .reduce((m, n) => Math.max(m, n.person_count || 0), 0);
+      return nodeMax;
+    }
+
+    // ── Polling: /api/v1/info ───────────────────────────────────────────────
+    async function pollInfo() {
+      try {
+        const r = await fetch(HTTP_BASE + '/api/v1/info', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        state.source = j.source || null;
+        setPill(el.pillHttp, 'ok', 'HTTP ' + (j.version || '在线'));
+      } catch (e) {
+        setPill(el.pillHttp, 'err', 'HTTP 离线');
+        state.source = null;
+      }
+      render();
+    }
+
+    // ── Polling: /api/v1/nodes ──────────────────────────────────────────────
+    async function pollNodes() {
+      try {
+        const r = await fetch(HTTP_BASE + '/api/v1/nodes', { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        state.nodes = Array.isArray(j.nodes) ? j.nodes : [];
+      } catch (e) {
+        state.nodes = [];
+      }
+      render();
+    }
+
+    // ── WebSocket: /ws/sensing ──────────────────────────────────────────────
+    function openWs() {
+      try { if (state.ws) state.ws.close(); } catch (_) {}
+      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+      const url = scheme + '://' + location.host + '/ws/sensing';
+      const ws = new WebSocket(url);
+      state.ws = ws;
+      setPill(el.pillWs, 'warn', 'WS 连接中…');
+      ws.onopen = () => {
+        state.wsConnected = true;
+        setPill(el.pillWs, 'ok', 'WS 已连接');
+      };
+      ws.onclose = () => {
+        state.wsConnected = false;
+        setPill(el.pillWs, 'err', 'WS 已断开');
+        setTimeout(openWs, WS_RECONNECT_MS);
+      };
+      ws.onerror = () => {
+        setPill(el.pillWs, 'err', 'WS 错误');
+      };
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg && msg.type === 'sensing_update') {
+            state.lastSensingUpdate = msg;
+            state.lastSensingAt = Date.now();
+            if (typeof msg.source === 'string') state.source = msg.source;
+            render();
+          }
+        } catch (_) { /* ignore malformed frames */ }
+      };
+    }
+
+    // ── Start ───────────────────────────────────────────────────────────────
+    pollInfo();
+    pollNodes();
+    openWs();
+    setInterval(pollInfo, INFO_POLL_MS);
+    setInterval(pollNodes, NODES_POLL_MS);
+    // Re-render once per second so the "last update" age and stale detection stay fresh.
+    setInterval(render, 1000);
+  })();
+  </script>
+</body>
+</html>

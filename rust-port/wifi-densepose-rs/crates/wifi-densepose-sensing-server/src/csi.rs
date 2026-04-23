@@ -626,12 +626,13 @@ pub fn estimate_persons_from_correlation(frame_history: &VecDeque<Vec<f64>>) -> 
     else { 3 }
 }
 
+/// Step the person count by at most ±1 per tick. Spikes in `smoothed_score`
+/// must not jump 1 → 3 in a single frame; the count has to walk through 2
+/// before reaching 3, and back through 2 before falling to 1.
 pub fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
     match prev_count {
         0 | 1 => {
-            if smoothed_score > 0.85 { 3 }
-            else if smoothed_score > 0.70 { 2 }
-            else { 1 }
+            if smoothed_score > 0.70 { 2 } else { 1 }
         }
         2 => {
             if smoothed_score > 0.92 { 3 }
@@ -639,9 +640,7 @@ pub fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
             else { 2 }
         }
         _ => {
-            if smoothed_score < 0.55 { 1 }
-            else if smoothed_score < 0.78 { 2 }
-            else { 3 }
+            if smoothed_score < 0.78 { 2 } else { 3 }
         }
     }
 }

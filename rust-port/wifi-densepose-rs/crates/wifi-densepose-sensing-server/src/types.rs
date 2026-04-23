@@ -164,6 +164,11 @@ pub struct PersonDetection {
     pub keypoints: Vec<PoseKeypoint>,
     pub bbox: BoundingBox,
     pub zone: String,
+    /// World-space position [x, y, z] in metres. Populated by RSSI trilateration
+    /// when ≥3 nodes with registered positions are active; otherwise [0, 0, 0].
+    /// Room convention: y = height above floor, (x, z) = floor plane.
+    #[serde(default)]
+    pub position: [f64; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

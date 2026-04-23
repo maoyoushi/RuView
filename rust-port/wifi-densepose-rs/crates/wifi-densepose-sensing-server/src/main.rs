@@ -13,6 +13,7 @@ mod adaptive_classifier;
 pub mod cli;
 pub mod csi;
 mod field_bridge;
+mod localize;
 mod multistatic_bridge;
 pub mod pose;
 mod rvf_container;
@@ -290,6 +291,11 @@ struct PersonDetection {
     keypoints: Vec<PoseKeypoint>,
     bbox: BoundingBox,
     zone: String,
+    /// World-space position [x, y, z] in metres. Populated by RSSI trilateration
+    /// when ≥3 nodes with registered positions are active; otherwise [0, 0, 0].
+    /// Room convention: y = height above floor, (x, z) = floor plane.
+    #[serde(default)]
+    position: [f64; 3],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1667,11 +1673,19 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let tracked = tracker_bridge::tracker_update(
+        let mut tracked = tracker_bridge::tracker_update(
             &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
         );
         s.last_tracker_instant = last_tracker_instant;
+        // Defensive cap: never broadcast more tracked persons than the
+        // score-based classifier deems plausible. Prevents Lost-track ghosts
+        // and any future tracker regression from inflating the UI count.
+        tracked = tracker_bridge::cap_persons_to_estimate(
+            tracked,
+            update.estimated_persons.unwrap_or(0),
+        );
         if !tracked.is_empty() {
+            localize::apply_trilateration(&mut tracked, &update.nodes);
             update.persons = Some(tracked);
         }
 
@@ -1805,11 +1819,16 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
 
     let raw_persons = derive_pose_from_sensing(&update);
     let mut last_tracker_instant = s.last_tracker_instant.take();
-    let tracked = tracker_bridge::tracker_update(
+    let mut tracked = tracker_bridge::tracker_update(
         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
     );
     s.last_tracker_instant = last_tracker_instant;
+    tracked = tracker_bridge::cap_persons_to_estimate(
+        tracked,
+        update.estimated_persons.unwrap_or(0),
+    );
     if !tracked.is_empty() {
+        localize::apply_trilateration(&mut tracked, &update.nodes);
         update.persons = Some(tracked);
     }
 
@@ -1986,6 +2005,7 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
                                             bbox: BoundingBox { x: 260.0, y: 150.0, width: 120.0, height: 220.0 },
                                             keypoints,
                                             zone: "zone_1".into(),
+                                            position: [0.0, 0.0, 0.0],
                                         }]
                                     }).unwrap_or_else(|| {
                                         // Prefer tracked persons from broadcast if available
@@ -2295,11 +2315,12 @@ fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
     // Down-thresholds (must drop below to decrease count):
     //   2→1: 0.55  (hysteresis gap of 0.25)
     //   3→2: 0.78  (hysteresis gap of 0.14)
+    // Never step the count by more than ±1 per tick. A noisy spike in the
+    // score should not jump 1 → 3 in a single frame (a regression that was
+    // contributing to the 1↔20+ flapping reported downstream of the tracker).
     match prev_count {
         0 | 1 => {
-            if smoothed_score > 0.85 {
-                3
-            } else if smoothed_score > 0.70 {
+            if smoothed_score > 0.70 {
                 2
             } else {
                 1
@@ -2316,9 +2337,7 @@ fn score_to_person_count(smoothed_score: f64, prev_count: usize) -> usize {
         }
         _ => {
             // prev_count >= 3
-            if smoothed_score < 0.55 {
-                1
-            } else if smoothed_score < 0.78 {
+            if smoothed_score < 0.78 {
                 2
             } else {
                 3 // hold
@@ -2504,6 +2523,7 @@ fn derive_single_person_pose(
             height: (max_y - min_y).max(160.0),
         },
         zone: format!("zone_{}", person_idx + 1),
+        position: [0.0, 0.0, 0.0],
     }
 }
 
@@ -3841,11 +3861,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
                     );
                     s.last_tracker_instant = last_tracker_instant;
+                    tracked = tracker_bridge::cap_persons_to_estimate(
+                        tracked,
+                        update.estimated_persons.unwrap_or(0),
+                    );
                     if !tracked.is_empty() {
+                        localize::apply_trilateration(&mut tracked, &update.nodes);
                         update.persons = Some(tracked);
                     }
 
@@ -4054,11 +4079,16 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
 
                     let raw_persons = derive_pose_from_sensing(&update);
                     let mut last_tracker_instant = s.last_tracker_instant.take();
-                    let tracked = tracker_bridge::tracker_update(
+                    let mut tracked = tracker_bridge::tracker_update(
                         &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
                     );
                     s.last_tracker_instant = last_tracker_instant;
+                    tracked = tracker_bridge::cap_persons_to_estimate(
+                        tracked,
+                        update.estimated_persons.unwrap_or(0),
+                    );
                     if !tracked.is_empty() {
+                        localize::apply_trilateration(&mut tracked, &update.nodes);
                         update.persons = Some(tracked);
                     }
 
@@ -4192,11 +4222,19 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
         let raw_persons = derive_pose_from_sensing(&update);
         let mut last_tracker_instant = s.last_tracker_instant.take();
-        let tracked = tracker_bridge::tracker_update(
+        let mut tracked = tracker_bridge::tracker_update(
             &mut s.pose_tracker, &mut last_tracker_instant, raw_persons,
         );
         s.last_tracker_instant = last_tracker_instant;
+        // Defensive cap: never broadcast more tracked persons than the
+        // score-based classifier deems plausible. Prevents Lost-track ghosts
+        // and any future tracker regression from inflating the UI count.
+        tracked = tracker_bridge::cap_persons_to_estimate(
+            tracked,
+            update.estimated_persons.unwrap_or(0),
+        );
         if !tracked.is_empty() {
+            localize::apply_trilateration(&mut tracked, &update.nodes);
             update.persons = Some(tracked);
         }
 

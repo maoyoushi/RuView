@@ -94,11 +94,19 @@ fn detections_to_tracker_keypoints(persons: &[PersonDetection]) -> Vec<[[f32; 3]
 
 /// Convert active PoseTracker tracks back into server-side PersonDetection values.
 ///
-/// Only tracks whose lifecycle `is_alive()` are included.
+/// Only confirmed tracks are exposed to downstream consumers. `Lost` tracks are
+/// excluded: the tracker keeps them alive for up to `reid_window` frames (100
+/// by default = 10 s at 10 fps) so their identity can be recovered, but they
+/// represent *remembered* persons, not currently-present ones. Emitting them as
+/// `PersonDetection` caused the broadcast person count to swell with ghost
+/// entries whenever per-frame heuristic poses jittered past the Mahalanobis
+/// gate — users saw the count jump between 1 and 20+ with no real change in
+/// occupancy. `Tentative` (new but unconfirmed) and `Active` tracks are kept.
 pub fn tracker_to_person_detections(tracker: &PoseTracker) -> Vec<PersonDetection> {
     tracker
         .active_tracks()
         .into_iter()
+        .filter(|track| !matches!(track.lifecycle, TrackLifecycleState::Lost))
         .map(|track| {
             let id = track.id.0 as u32;
 
@@ -160,9 +168,27 @@ pub fn tracker_to_person_detections(tracker: &PoseTracker) -> Vec<PersonDetectio
                 keypoints,
                 bbox,
                 zone: "tracked".to_string(),
+                // Trilateration is applied downstream in main.rs after tracker_update,
+                // using update.nodes RSSI + registered node positions.
+                position: [0.0, 0.0, 0.0],
             }
         })
         .collect()
+}
+
+/// Cap tracker output to an upstream estimate so a noisy tracker cannot
+/// inflate the reported person count past what the score-based classifier
+/// considers plausible.
+///
+/// Sorts by descending confidence so the most trustworthy tracks survive.
+/// A `cap` of 0 returns an empty vec (use when presence is false).
+pub fn cap_persons_to_estimate(mut persons: Vec<PersonDetection>, cap: usize) -> Vec<PersonDetection> {
+    if persons.len() <= cap {
+        return persons;
+    }
+    persons.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    persons.truncate(cap);
+    persons
 }
 
 /// Run one tracker cycle: predict, match detections, update, prune.
@@ -307,6 +333,7 @@ mod tests {
                 height: 1.0,
             },
             zone: "test".to_string(),
+            position: [0.0, 0.0, 0.0],
         }
     }
 
@@ -405,5 +432,96 @@ mod tests {
         // All three updates should return the same track ID
         assert_eq!(id1, id2, "Track ID should be stable across updates");
         assert_eq!(id2, id3, "Track ID should be stable across updates");
+    }
+
+    /// Regression: a detection that vanishes (no matching re-submission) must
+    /// NOT keep showing up in subsequent output for the full `reid_window`
+    /// (100 frames in the default config). That ghost-track behavior caused
+    /// the broadcast person count to drift from 1 to 20+ even when nobody
+    /// was present — the tracker was keeping `Lost` tracks alive as part of
+    /// its re-ID window, and the bridge was exporting them to the UI.
+    #[test]
+    fn test_lost_tracks_excluded_from_output() {
+        use wifi_densepose_signal::ruvsense::pose_tracker::PoseTracker;
+
+        let mut tracker = PoseTracker::new();
+        let mut last_instant: Option<Instant> = None;
+
+        let person = make_person(
+            0,
+            vec![
+                make_keypoint("nose", 1.0, 2.0, 0.0),
+                make_keypoint("left_shoulder", 0.8, 2.5, 0.0),
+                make_keypoint("right_shoulder", 1.2, 2.5, 0.0),
+                make_keypoint("left_hip", 0.9, 3.5, 0.0),
+                make_keypoint("right_hip", 1.1, 3.5, 0.0),
+            ],
+        );
+
+        // Frame 1: seed a track.
+        let r1 = tracker_update(&mut tracker, &mut last_instant, vec![person.clone()]);
+        assert_eq!(r1.len(), 1);
+
+        // Frames 2..=8: no detections. With loss_misses=5 the track should
+        // transition Tentative/Active -> Lost somewhere along the way, and
+        // the bridge must stop emitting it.
+        for _ in 0..8 {
+            let _ = tracker_update(&mut tracker, &mut last_instant, vec![]);
+        }
+        let final_out = tracker_update(&mut tracker, &mut last_instant, vec![]);
+        assert_eq!(
+            final_out.len(),
+            0,
+            "Lost tracks must not leak into broadcast output; got {} ghost persons",
+            final_out.len()
+        );
+    }
+
+    #[test]
+    fn test_cap_persons_to_estimate_truncates_by_confidence() {
+        let mk = |id: u32, conf: f64| PersonDetection {
+            id,
+            confidence: conf,
+            keypoints: vec![],
+            bbox: BoundingBox { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            zone: "test".into(),
+            position: [0.0, 0.0, 0.0],
+        };
+        // 5 tracker outputs but the score-based estimator says 2 people.
+        let persons = vec![mk(10, 0.3), mk(11, 0.9), mk(12, 0.5), mk(13, 0.7), mk(14, 0.1)];
+        let capped = cap_persons_to_estimate(persons, 2);
+        assert_eq!(capped.len(), 2);
+        // Top-2 confidences must be retained.
+        assert_eq!(capped[0].id, 11);
+        assert_eq!(capped[1].id, 13);
+    }
+
+    #[test]
+    fn test_cap_persons_to_estimate_passthrough_when_within_cap() {
+        let mk = |id: u32| PersonDetection {
+            id,
+            confidence: 0.8,
+            keypoints: vec![],
+            bbox: BoundingBox { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            zone: "test".into(),
+            position: [0.0, 0.0, 0.0],
+        };
+        let persons = vec![mk(1), mk(2)];
+        let capped = cap_persons_to_estimate(persons, 5);
+        assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn test_cap_persons_to_estimate_zero_clears() {
+        let mk = |id: u32| PersonDetection {
+            id,
+            confidence: 0.8,
+            keypoints: vec![],
+            bbox: BoundingBox { x: 0.0, y: 0.0, width: 1.0, height: 1.0 },
+            zone: "test".into(),
+            position: [0.0, 0.0, 0.0],
+        };
+        let capped = cap_persons_to_estimate(vec![mk(1), mk(2), mk(3)], 0);
+        assert_eq!(capped.len(), 0, "cap of 0 (no presence) must return empty");
     }
 }
